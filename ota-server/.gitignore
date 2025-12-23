@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment
+.env
+.env.local
+
+# Apps directory (keep directory structure, ignore contents)
+apps/*/
+!apps/.gitkeep
+apps/*/bin/*
+apps/*/config/*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
