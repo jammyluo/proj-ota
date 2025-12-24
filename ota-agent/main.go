@@ -86,7 +86,7 @@ func retryHTTPRequest(maxRetries int, delay time.Duration, fn func() (*http.Resp
 	return nil, fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
 }
 
-func fetchConfig(url string, agentID string, timeout time.Duration, maxRetries int, logger *Logger) (*Config, error) {
+func fetchConfig(url string, agentID string, localVer string, timeout time.Duration, maxRetries int, logger *Logger) (*Config, error) {
 	client := &http.Client{Timeout: timeout}
 	var resp *http.Response
 	var err error
@@ -99,6 +99,9 @@ func fetchConfig(url string, agentID string, timeout time.Duration, maxRetries i
 			}
 			if agentID != "" {
 				req.Header.Set("X-Agent-ID", agentID)
+			}
+			if localVer != "" {
+				req.Header.Set("X-Local-Version", localVer)
 			}
 			r, e := client.Do(req)
 			if e != nil {
@@ -117,6 +120,9 @@ func fetchConfig(url string, agentID string, timeout time.Duration, maxRetries i
 		if agentID != "" {
 			req.Header.Set("X-Agent-ID", agentID)
 		}
+		if localVer != "" {
+			req.Header.Set("X-Local-Version", localVer)
+		}
 		resp, err = client.Do(req)
 	}
 
@@ -131,6 +137,49 @@ func fetchConfig(url string, agentID string, timeout time.Duration, maxRetries i
 		return nil, fmt.Errorf("decode yaml: %w", err)
 	}
 	return &cfg, nil
+}
+
+// 获取可执行文件所在目录（更健壮的版本）
+func getExecutableDir() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("failed to get executable path: %w", err)
+	}
+
+	// 解析符号链接
+	exePath, err = filepath.EvalSymlinks(exePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
+	}
+
+	// 获取绝对路径
+	exePath, err = filepath.Abs(exePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	return filepath.Dir(exePath), nil
+}
+
+// 获取相对于可执行文件的路径
+func getExecutableRelativePath(relativePath string) (string, error) {
+	exeDir, err := getExecutableDir()
+	if err != nil {
+		return "", err
+	}
+
+	// 清理路径，防止路径遍历攻击
+	cleanPath := filepath.Clean(relativePath)
+	if filepath.IsAbs(cleanPath) {
+		return "", fmt.Errorf("relative path cannot be absolute: %s", relativePath)
+	}
+
+	// 检查是否包含 .. 路径遍历
+	if strings.Contains(cleanPath, "..") {
+		return "", fmt.Errorf("relative path cannot contain '..': %s", relativePath)
+	}
+
+	return filepath.Join(exeDir, cleanPath), nil
 }
 
 func readLocalVersion(path string) (string, error) {
@@ -257,6 +306,7 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
+// runCommand runs a command once (backward compatibility)
 func runCommand(cmdline string) error {
 	parts := strings.Fields(cmdline)
 	if len(parts) == 0 {
@@ -390,7 +440,7 @@ func validateConfig(cfg *Config) error {
 }
 
 // updateFile updates a single file
-func updateFile(file FileUpdate, fileVersion string, versionFile string, restartCmd string, agentID string, timeout time.Duration, maxRetries int, logger *Logger) (bool, error) {
+func updateFile(file FileUpdate, restartCmd string, agentID string, timeout time.Duration, maxRetries int, logger *Logger) (bool, error) {
 	logger.Info("updating file %s (target: %s)", file.Name, file.Target)
 
 	// Check write permission
@@ -455,25 +505,36 @@ func updateFile(file FileUpdate, fileVersion string, versionFile string, restart
 	return true, nil
 }
 
+// UpdateResult represents the result of an update check
+type UpdateResult struct {
+	Updated       bool   // Whether files were updated
+	RestartCmd    string // Restart command from remote config (empty if not provided)
+	RemoteVersion string // Remote version
+	Error         error  // Error if update check failed
+}
+
 // checkUpdate checks for updates and applies them
-func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time.Duration, maxRetries int, logger *Logger) error {
+// Returns UpdateResult with update status and restart command
+// This function only handles file updates, not process management
+func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time.Duration, maxRetries int, logger *Logger) UpdateResult {
 	logger.Info("checking for updates from %s", cfgURL)
-
-	remoteCfg, err := fetchConfig(cfgURL, agentID, timeout, maxRetries, logger)
-	if err != nil {
-		return fmt.Errorf("fetch config: %w", err)
-	}
-
-	// Validate configuration
-	if err := validateConfig(remoteCfg); err != nil {
-		return fmt.Errorf("invalid remote config: %w", err)
-	}
-
 	// Read local version
 	localVer, err := readLocalVersion(versionFile)
 	if err != nil {
 		logger.Warn("read local version error: %v, treating as no version", err)
 		localVer = ""
+	}
+	// Fetch remote configuration
+	remoteCfg, err := fetchConfig(cfgURL, agentID, localVer, timeout, maxRetries, logger)
+	if err != nil {
+		logger.Error("failed to fetch remote config: %v", err)
+		return UpdateResult{Error: fmt.Errorf("fetch config: %w", err)}
+	}
+
+	// Validate configuration
+	if err := validateConfig(remoteCfg); err != nil {
+		logger.Error("invalid remote config: %v", err)
+		return UpdateResult{Error: fmt.Errorf("invalid remote config: %w", err)}
 	}
 
 	logger.Info("remote version=%s, local version=%s", remoteCfg.Version, localVer)
@@ -481,7 +542,11 @@ func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time
 	// Check if update needed
 	if remoteCfg.Version == localVer {
 		logger.Info("versions equal, no update needed")
-		return nil
+		return UpdateResult{
+			Updated:       false,
+			RestartCmd:    remoteCfg.RestartCmd,
+			RemoteVersion: remoteCfg.Version,
+		}
 	}
 
 	// Get files from config
@@ -491,12 +556,7 @@ func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time
 	updated := false
 	var lastErr error
 	for _, file := range files {
-		fileVersion := file.Version
-		if fileVersion == "" {
-			fileVersion = remoteCfg.Version
-		}
-
-		success, err := updateFile(file, fileVersion, versionFile, remoteCfg.RestartCmd, agentID, timeout, maxRetries, logger)
+		success, err := updateFile(file, "", agentID, timeout, maxRetries, logger)
 		if err != nil {
 			logger.Error("failed to update %s: %v", file.Name, err)
 			lastErr = err
@@ -504,15 +564,6 @@ func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time
 		}
 		if success {
 			updated = true
-		}
-	}
-
-	// Global restart command after all updates
-	if updated && remoteCfg.RestartCmd != "" {
-		logger.Info("running global restart_cmd: %s", remoteCfg.RestartCmd)
-		if err := runCommand(remoteCfg.RestartCmd); err != nil {
-			logger.Error("global restart failed: %v", err)
-			return fmt.Errorf("global restart failed: %w", err)
 		}
 	}
 
@@ -526,18 +577,25 @@ func checkUpdate(cfgURL string, versionFile string, agentID string, timeout time
 		logger.Info("update to %s complete", remoteCfg.Version)
 	}
 
+	result := UpdateResult{
+		Updated:       updated,
+		RestartCmd:    remoteCfg.RestartCmd,
+		RemoteVersion: remoteCfg.Version,
+	}
 	if lastErr != nil {
-		return lastErr
+		result.Error = lastErr
 	}
 
-	return nil
+	return result
 }
 
 func main() {
+	defaultVersionFile, _ := getExecutableRelativePath("version")
 	// flags / env
 	cfgURL := flag.String("config-url", "", "URL to version.yaml (required)")
-	versionFile := flag.String("version-file", "version", "local version file path")
+	versionFile := flag.String("version-file", defaultVersionFile, "local version file path")
 	agentID := flag.String("agent-id", "", "Agent identifier (sent as X-Agent-ID header)")
+	startCmd := flag.String("start-cmd", "", "Local command for initial process start (used when no update needed)")
 	timeout := flag.Duration("timeout", 30*time.Second, "http timeout")
 	maxRetries := flag.Int("max-retries", 3, "maximum number of retries for HTTP requests")
 	checkInterval := flag.Duration("check-interval", 5*time.Minute, "check interval for daemon mode")
@@ -546,44 +604,56 @@ func main() {
 
 	logger := newLogger()
 
-	if *cfgURL == "" {
-		logger.Error("config-url is required")
-		os.Exit(2)
-	}
-
 	// Ensure version file directory exists
 	if err := os.MkdirAll(filepath.Dir(*versionFile), 0755); err != nil {
 		logger.Error("failed to create version file directory: %v", err)
 		os.Exit(1)
 	}
 
-	// Run once or as daemon
-	if !*daemon {
-		// Run once
-		if err := checkUpdate(*cfgURL, *versionFile, *agentID, *timeout, *maxRetries, logger); err != nil {
-			logger.Error("update check failed: %v", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	// Daemon mode
-	logger.Info("starting OTA agent daemon")
+	logger.Info("starting OTA agent")
 	logger.Info("config URL: %s", *cfgURL)
 	logger.Info("agent ID: %s", *agentID)
 	logger.Info("check interval: %v", *checkInterval)
 	logger.Info("version file: %s", *versionFile)
+	logger.Info("daemon mode: %t", *daemon)
+	if *startCmd != "" {
+		logger.Info("start command: %s (for initial process start)", *startCmd)
+	}
 
-	// 设置环境变量agentID=server-001
-	os.Setenv("AGENT_ID", *agentID)
+	runCmd := *startCmd
+
+	result := checkUpdate(*cfgURL, *versionFile, *agentID, *timeout, *maxRetries, logger)
+	if result.Error != nil {
+		logger.Error("Start OTA agent checkUpdate failed: %v", result.Error)
+	}
+
+	if result.Error == nil && result.Updated && result.RestartCmd != "" {
+		runCmd = result.RestartCmd
+	}
+
+	logger.Info("runCmd: %s", runCmd)
+	if err := runCommand(runCmd); err != nil {
+		logger.Error("Start OTA agent runCommand failed: %v", err)
+	}
+
+	// Run once or as daemon
+	if !*daemon {
+		logger.Info("single-run mode, exiting")
+		return
+	}
+	logger.Info("starting OTA agent in daemon mode")
 
 	// Handle signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Run initial check
-	if err := checkUpdate(*cfgURL, *versionFile, *agentID, *timeout, *maxRetries, logger); err != nil {
-		logger.Error("initial update check failed: %v", err)
+	// Process management function
+	handleProcessManagement := func(result UpdateResult) {
+		if result.Error == nil && result.Updated && result.RestartCmd != "" {
+			if _, err := ensureManagedProcess(result.RestartCmd, "after update (from remote config)", logger); err != nil {
+				logger.Error("failed to ensure managed process: %v", err)
+			}
+		}
 	}
 
 	// Periodic check
@@ -593,11 +663,21 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := checkUpdate(*cfgURL, *versionFile, *agentID, *timeout, *maxRetries, logger); err != nil {
-				logger.Error("update check failed: %v", err)
+			result := checkUpdate(*cfgURL, *versionFile, *agentID, *timeout, *maxRetries, logger)
+			if result.Error != nil {
+				logger.Error("update check failed: %v", result.Error)
+			} else {
+				handleProcessManagement(result)
 			}
+
 		case sig := <-sigChan:
 			logger.Info("received signal %v, shutting down...", sig)
+			// Stop managed process gracefully
+			if err := stopManagedProcess(); err != nil {
+				logger.Error("failed to stop managed process: %v", err)
+			} else {
+				logger.Info("managed process stopped")
+			}
 			return
 		}
 	}

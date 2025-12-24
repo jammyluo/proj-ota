@@ -193,6 +193,8 @@ OTA agent 客户端使用应用专属的配置 URL：
 
 **Agent ID**: 建议为每个 agent 实例设置唯一的标识符（如服务器主机名、设备 ID 等），这样可以在服务器端准确跟踪每个 agent 的状态。如果不提供，服务器将使用 IP 地址作为标识符。
 
+**Local Version**: Agent 会在请求中通过 `X-Local-Version` header 发送本地版本号，服务器会记录并跟踪每个 agent 的本地版本，方便监控和调试。
+
 详细说明请参考 [../ota-agent/README.md](../ota-agent/README.md)
 
 ## 工作流程
@@ -360,6 +362,25 @@ curl http://localhost:3000/ota/app1/info
 
 # 查看应用的所有 agent 状态
 curl http://localhost:3000/ota/app1/agents
+
+# 返回示例：
+# {
+#   "app": "app1",
+#   "agents": [
+#     {
+#       "id": "server-001",
+#       "localVersion": "1.0.0",
+#       "ip": "192.168.1.100",
+#       "lastSeen": "2025-12-23T10:30:00.000Z",
+#       "requestCount": 5,
+#       "currentVersion": "1.0.1",
+#       "lastAction": "config_check",
+#       "userAgent": "ota-agent/1.0"
+#     }
+#   ],
+#   "total": 1,
+#   "timestamp": "2025-12-23T10:30:00.000Z"
+# }
 ```
 
 ### 多应用配置文件示例

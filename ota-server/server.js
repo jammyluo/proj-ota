@@ -17,7 +17,7 @@ if (!fs.existsSync(APPS_DIR)) {
 }
 
 // Agent 状态存储
-// 结构: { appName: { agentId: { ip, lastSeen, requestCount, currentVersion, lastAction, userAgent } } }
+// 结构: { appName: { agentId: { id, ip, lastSeen, requestCount, currentVersion, localVersion, lastAction, userAgent } } }
 const agentStatus = new Map();
 
 // 获取客户端 IP 地址
@@ -40,6 +40,7 @@ function recordAgentStatus(appName, req, action, version = null) {
   const userAgent = req.headers['user-agent'] || 'unknown';
   // 优先使用 agent 主动提供的 ID，否则使用 IP 作为 fallback
   const agentId = req.headers['x-agent-id'] || ip;
+  const localVersion = req.headers['x-local-version'] || '';
   const now = new Date().toISOString();
   
   if (!agentStatus.has(appName)) {
@@ -50,6 +51,7 @@ function recordAgentStatus(appName, req, action, version = null) {
   if (!appAgents.has(agentId)) {
     appAgents.set(agentId, {
       id: agentId,
+      localVersion: localVersion,
       ip: ip,
       lastSeen: now,
       requestCount: 0,
@@ -65,6 +67,10 @@ function recordAgentStatus(appName, req, action, version = null) {
   agent.lastAction = action;
   if (version) {
     agent.currentVersion = version;
+  }
+  // 更新 localVersion（如果 agent 提供了）
+  if (localVersion) {
+    agent.localVersion = localVersion;
   }
   // 如果 agent 提供了 ID，更新 IP（可能 IP 会变化）
   if (req.headers['x-agent-id']) {
